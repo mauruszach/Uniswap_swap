@@ -1,163 +1,91 @@
 import React, { useState } from 'react';
 import { ethers } from 'ethers';
 import { Trade, Route, Pool } from '@uniswap/v4-sdk';
-import { CurrencyAmount, Token } from '@uniswap/sdk-core';
+import { Token, CurrencyAmount, Percent } from '@uniswap/sdk-core';
 
-// Since the SDK doesn’t export an EMPTY_HOOK constant, defining one:
-const EMPTY_HOOK = "0x0000000000000000000000000000000000000000";
+const TradeComponent = () => {
+  const [fromToken, setFromToken] = useState('');
+  const [toToken, setToToken] = useState('');
+  const [amount, setAmount] = useState('');
+  const [swapResult, setSwapResult] = useState('');
 
-// Polygon Pool Manager Address for Uniswap v4
-const POOL_MANAGER_ADDRESS = "0x67366782805870060151383f4bbff9dab53e5cd6";
-
-// Minimal ABI for PoolManager functions used to read pool state.
-const poolManagerAbi = [
-  "function getSlot0(bytes32) view returns (uint160 sqrtPriceX96, int24 tick)",
-  "function getLiquidity(bytes32) view returns (uint128 liquidity)"
-];
-
-async function fetchPoolData(provider, poolKeyId) {
-  const poolManager = new ethers.Contract(POOL_MANAGER_ADDRESS, poolManagerAbi, provider);
-  const [slot0, liquidity] = await Promise.all([
-    poolManager.getSlot0(poolKeyId),
-    poolManager.getLiquidity(poolKeyId)
-  ]);
-  return {
-    sqrtPriceX96: slot0[0].toString(),
-    tick: slot0[1],
-    liquidity: liquidity.toString()
-  };
-}
-
-const Swap = () => {
-  // State for user input token addresses, poolKeyId, trade data, and errors.
-  const [tokenAAddress, setTokenAAddress] = useState("");
-  const [tokenBAddress, setTokenBAddress] = useState("");
-  const [poolKeyId, setPoolKeyId] = useState("");
-  const [trade, setTrade] = useState(null);
-  const [error, setError] = useState("");
-
-  // Define constants for the Polygon network and pool parameters.
-  const chainId = 137;
-  const fee = 3000;
-  const tickSpacing = 60;
-  const hookAddress = EMPTY_HOOK;
-
-  // Create an ethers provider (make sure window.ethereum is available).
-  const provider = new ethers.providers.Web3Provider(window.ethereum);
-
-  // Compute the poolKeyId based on the token addresses, fee, tick spacing, and hook address.
-  const computePoolKeyId = (tokenAAddr, tokenBAddr) => {
-    return ethers.utils.solidityKeccak256(
-      ['address', 'address', 'uint24', 'int24', 'address'],
-      [tokenAAddr, tokenBAddr, fee, tickSpacing, hookAddress]
-    );
-  };
-
-  // This function is triggered when the user clicks the "Execute Swap" button.
-  const handleExecuteSwap = async () => {
+  const handleSwap = async () => {
     try {
-      // Validate that both token addresses are entered.
-      if (!tokenAAddress || !tokenBAddress) {
-        setError("Please enter both token addresses.");
-        return;
-      }
+      // Connect to MetaMask
+      const provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send('eth_requestAccounts', []);
+      const signer = provider.getSigner();
 
-      // Format and validate token addresses.
-      const tokenAAddr = ethers.utils.getAddress(tokenAAddress);
-      const tokenBAddr = ethers.utils.getAddress(tokenBAddress);
+      // Define tokens
+      const chainId = 137; // Polygon Mainnet
+      const FROM_TOKEN = new Token(chainId, fromToken, 18);
+      const TO_TOKEN = new Token(chainId, toToken, 18);
 
-      // Create Token instances. (For demonstration, we use 18 decimals and placeholder symbols.)
-      const tokenA = new Token(chainId, tokenAAddr, 18, "TKN0");
-      const tokenB = new Token(chainId, tokenBAddr, 18, "TKN1");
+      // Parse input amount
+      const typedValueParsed = ethers.utils.parseUnits(amount, 18);
+      const inputCurrencyAmount = CurrencyAmount.fromRawAmount(FROM_TOKEN, typedValueParsed.toString());
 
-      // Compute and display the poolKeyId.
-      const computedPoolKeyId = computePoolKeyId(tokenAAddr, tokenBAddr);
-      setPoolKeyId(computedPoolKeyId);
+      // Fetch pool data (mock example)
+      // You need to fetch the pool data using on-chain methods or APIs
+      const pool = new Pool(FROM_TOKEN, TO_TOKEN, /* fee */ 3000, /* sqrtPriceX96 */ '1', /* liquidity */ '1', /* tickCurrent */ 0);
 
-      // Fetch pool data from the Pool Manager using the computed poolKeyId.
-      const poolData = await fetchPoolData(provider, computedPoolKeyId);
+      // Create a route and trade
+      const route = new Route([pool], FROM_TOKEN, TO_TOKEN);
+      const trade = Trade.exactIn(route, inputCurrencyAmount);
 
-      // Create a Pool instance with the retrieved data.
-      const pool = new Pool(
-        tokenA,
-        tokenB,
-        fee,
-        tickSpacing,
-        hookAddress,
-        poolData.sqrtPriceX96,
-        poolData.liquidity,
-        poolData.tick
-      );
+      // Transaction parameters
+      const slippageTolerance = new Percent(50, 10_000); // 0.5% slippage tolerance
+      const deadline = Math.floor(Date.now() / 1000 + 1800); // Deadline: 30 minutes from now
 
-      // Create a Route from the pool. In this trade, tokenA is the input and tokenB is the output.
-      const route = new Route([pool], tokenA, tokenB);
+      const methodParameters = trade.swapCallParameters({
+        recipient: await signer.getAddress(),
+        slippageTolerance,
+        deadline,
+      });
 
-      // Define the exact input amount: 1 unit of tokenA.
-      const amountIn = CurrencyAmount.fromRawAmount(
-        tokenA,
-        ethers.utils.parseUnits("1", 18).toString()
-      );
+      // Prepare transaction data
+      const transaction = {
+        data: methodParameters.calldata,
+        to: methodParameters.to,
+        value: methodParameters.value,
+        from: await signer.getAddress(),
+        gasLimit: ethers.utils.hexlify(300000), // Adjust as needed
+        gasPrice: await provider.getGasPrice(),
+      };
 
-      // Build an exactIn trade using the SDK’s static method.
-      const exactInTrade = await Trade.exactIn(route, amountIn);
-
-      // Update the trade state and clear any previous errors.
-      setTrade(exactInTrade);
-      setError("");
-    } catch (err) {
-      setError(err.message);
+      // Send transaction
+      const tx = await signer.sendTransaction(transaction);
+      const receipt = await tx.wait();
+      setSwapResult(`Swap successful! Transaction hash: ${receipt.transactionHash}`);
+    } catch (error) {
+      setSwapResult(`Swap failed: ${error.message}`);
     }
   };
 
   return (
-    <div style={{ color: 'black' }}>
-      <h2>Trade Information</h2>
-      <div>
-        <label>
-          Token A Address:
-          <input
-            type="text"
-            value={tokenAAddress}
-            onChange={(e) => setTokenAAddress(e.target.value)}
-            placeholder="Enter Token A address"
-          />
-        </label>
-      </div>
-      <div>
-        <label>
-          Token B Address:
-          <input
-            type="text"
-            value={tokenBAddress}
-            onChange={(e) => setTokenBAddress(e.target.value)}
-            placeholder="Enter Token B address"
-          />
-        </label>
-      </div>
-      <div>
-        <button onClick={handleExecuteSwap}>Execute Swap</button>
-      </div>
-      {poolKeyId && (
-        <div>
-          <p><strong>Pool Key ID:</strong> {poolKeyId}</p>
-        </div>
-      )}
-      {error && <p style={{ color: 'black' }}>Error: {error}</p>}
-      {trade ? (
-        <div>
-          <p><strong>Trade Type:</strong> {trade.tradeType}</p>
-          <p>
-            <strong>Input Amount:</strong> {trade.inputAmount.toSignificant(6)} {trade.inputAmount.currency.symbol}
-          </p>
-          <p>
-            <strong>Output Amount:</strong> {trade.outputAmount.toSignificant(6)} {trade.outputAmount.currency.symbol}
-          </p>
-        </div>
-      ) : (
-        <p>Enter token addresses and click "Execute Swap" to load trade data.</p>
-      )}
+    <div>
+      <input
+        type="text"
+        placeholder="From Token Address"
+        value={fromToken}
+        onChange={(e) => setFromToken(e.target.value)}
+      />
+      <input
+        type="text"
+        placeholder="To Token Address"
+        value={toToken}
+        onChange={(e) => setToToken(e.target.value)}
+      />
+      <input
+        type="text"
+        placeholder="Amount"
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+      />
+      <button onClick={handleSwap}>Swap</button>
+      <p>{swapResult}</p>
     </div>
   );
 };
 
-export default Swap;
+export default TradeComponent;
