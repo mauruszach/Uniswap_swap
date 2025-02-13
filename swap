@@ -1,64 +1,275 @@
 import React, { useState } from 'react';
 import { ethers } from 'ethers';
-import { Trade, Route, Pool } from '@uniswap/v4-sdk';
-import { Token, CurrencyAmount, Percent } from '@uniswap/sdk-core';
+import { Trade, Route, Pool, V4PositionPlanner } from '@uniswap/v4-sdk';
+import { Ether, Token, CurrencyAmount, Percent } from '@uniswap/sdk-core';
 
 const TradeComponent = () => {
-  const [fromToken, setFromToken] = useState('');
-  const [toToken, setToToken] = useState('');
+  // Default values: use the "0x...1010" as the native token identifier.
+  const [fromToken, setFromToken] = useState('0x0000000000000000000000000000000000001010');
+  const [toToken, setToToken] = useState('0xc2132D05D31c914a87C6611C10748AEb04B58e8F');
   const [amount, setAmount] = useState('');
   const [swapResult, setSwapResult] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Helper: Format a BigNumber with 18 decimals (for logging purposes)
+  const formatWith18Decimals = (value) => {
+    try {
+      const bnValue = ethers.BigNumber.from(value);
+      let formatted = ethers.utils.formatUnits(bnValue, 18);
+      if (!formatted.includes('.')) {
+        formatted += '.000000000000000000';
+      } else {
+        const [intPart, decPart] = formatted.split('.');
+        formatted = intPart + '.' + decPart.padEnd(18, '0');
+      }
+      return formatted;
+    } catch (error) {
+      return value;
+    }
+  };
+
+  const logBN = (label, value) => {
+    console.log(label, formatWith18Decimals(value));
+  };
 
   const handleSwap = async () => {
+    setIsLoading(true);
+    setSwapResult('');
     try {
-      // Connect to MetaMask
+      // Check for MetaMask (or any injected provider)
+      if (!window.ethereum) {
+        throw new Error('MetaMask not detected. Please install MetaMask.');
+      }
+
+      // Set up ethers provider and signer
       const provider = new ethers.providers.Web3Provider(window.ethereum);
       await provider.send('eth_requestAccounts', []);
       const signer = provider.getSigner();
+      const recipient = await signer.getAddress();
 
-      // Define tokens
-      const chainId = 137; // Polygon Mainnet
-      const FROM_TOKEN = new Token(chainId, fromToken, 18);
-      const TO_TOKEN = new Token(chainId, toToken, 18);
+      // Parse and log the input amount
+      console.log("Raw input amount (string):", amount);
+      const typedValueParsed = ethers.utils.parseUnits(amount.trim(), 18);
+      logBN("Parsed input amount:", typedValueParsed);
 
-      // Parse input amount
-      const typedValueParsed = ethers.utils.parseUnits(amount, 18);
-      const inputCurrencyAmount = CurrencyAmount.fromRawAmount(FROM_TOKEN, typedValueParsed.toString());
+      // Set the chainId (for example, Polygon = 137)
+      const chainId = 137;
 
-      // Fetch pool data (mock example)
-      // You need to fetch the pool data using on-chain methods or APIs
-      const pool = new Pool(FROM_TOKEN, TO_TOKEN, /* fee */ 3000, /* sqrtPriceX96 */ '1', /* liquidity */ '1', /* tickCurrent */ 0);
+      // Create currency objects
+      // If fromToken matches the native token identifier, use Ether.onChain; otherwise, create a Token.
+      const currencyA =
+        fromToken === '0x0000000000000000000000000000000000001010'
+          ? Ether.onChain(chainId)
+          : new Token(chainId, fromToken, 18);
+      const currencyB = new Token(chainId, toToken, 18);
 
-      // Create a route and trade
-      const route = new Route([pool], FROM_TOKEN, TO_TOKEN);
-      const trade = Trade.exactIn(route, inputCurrencyAmount);
+      // Pool parameters
+      const fee = 3000;
+      const tickSpacing = 60;
+      const hooks = '0x0000000000000000000000000000000000000000';
 
-      // Transaction parameters
-      const slippageTolerance = new Percent(50, 10_000); // 0.5% slippage tolerance
-      const deadline = Math.floor(Date.now() / 1000 + 1800); // Deadline: 30 minutes from now
+      // Get pool ID
+      const poolId = Pool.getPoolId(currencyA, currencyB, fee, tickSpacing, hooks);
+      console.log("Pool ID:", poolId);
 
-      const methodParameters = trade.swapCallParameters({
-        recipient: await signer.getAddress(),
-        slippageTolerance,
-        deadline,
+      // Set up state view contract to fetch pool data.
+      // IMPORTANT: Verify that the stateViewAddress is correct for your network.
+      const stateViewAddress = '0x5ea1bd7974c8a611cbab0bdcafcb1d9cc9b3ba5a';
+      const stateViewABI = [
+        "function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
+        "function getTickInfo(bytes32 poolId, int24 tick) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128)"
+      ];
+      const stateViewContract = new ethers.Contract(stateViewAddress, stateViewABI, provider);
+
+      // Fetch pool state from slot0
+      const slot0 = await stateViewContract.getSlot0(poolId);
+      console.log("Slot0 Data:", {
+        sqrtPriceX96: formatWith18Decimals(slot0.sqrtPriceX96),
+        tick: slot0.tick.toString(),
+        protocolFee: slot0.protocolFee.toString(),
+        lpFee: slot0.lpFee.toString()
       });
 
-      // Prepare transaction data
-      const transaction = {
-        data: methodParameters.calldata,
-        to: methodParameters.to,
-        value: methodParameters.value,
-        from: await signer.getAddress(),
-        gasLimit: ethers.utils.hexlify(300000), // Adjust as needed
-        gasPrice: await provider.getGasPrice(),
+      // Align the current tick to the nearest multiple of tickSpacing
+      const alignedTick = Math.round(slot0.tick / tickSpacing) * tickSpacing;
+      console.log("Aligned Tick:", alignedTick);
+
+      // Expand tick range for liquidity search (for example, ±3 ticks)
+      const tickRange = [-3, -2, -1, 0, 1, 2, 3].map(i => alignedTick + i * tickSpacing);
+
+      let bestTickInfo = null;
+      let bestTick = null;
+
+      // Loop over tick range to find a tick with sufficient liquidity
+      for (const tick of tickRange) {
+        try {
+          const tickInfo = await stateViewContract.getTickInfo(poolId, tick);
+          console.log(`Tick ${tick}:`, {
+            liquidityGross: tickInfo.liquidityGross.toString(),
+            liquidityNet: tickInfo.liquidityNet.toString(),
+          });
+
+          if (tickInfo && tickInfo.liquidityGross && tickInfo.liquidityGross.gt(0)) {
+            if (bestTickInfo === null || tickInfo.liquidityGross.gt(bestTickInfo.liquidityGross)) {
+              bestTickInfo = tickInfo;
+              bestTick = tick;
+            }
+          }
+        } catch (error) {
+          console.error(`Error fetching tick info for tick ${tick}:`, error);
+          continue;
+        }
+      }
+
+      // If no liquidity is found in the specified range, exit early.
+      if (!bestTickInfo) {
+        console.warn("No liquidity found in the tick range.");
+        setSwapResult("No liquidity found in the specified tick range.");
+        setIsLoading(false);
+        return;
+      }
+
+      console.log("Best Tick Info:", bestTickInfo);
+      console.log("Best Tick:", bestTick);
+
+      // Build the tick list for constructing the pool
+      const liquidity = bestTickInfo.liquidityGross.toString();
+      const tickList = [{
+        index: bestTick,
+        liquidityGross: bestTickInfo.liquidityGross.toString(),
+        liquidityNet: bestTickInfo.liquidityNet.toString(),
+        feeGrowthOutside0X128: bestTickInfo.feeGrowthOutside0X128.toString(),
+        feeGrowthOutside1X128: bestTickInfo.feeGrowthOutside1X128.toString(),
+      }];
+
+      // Optionally add an extra tick based on total liquidity net
+      const totalLiquidityNet = tickList.reduce(
+        (acc, tick) => ethers.BigNumber.from(tick.liquidityNet).add(acc),
+        ethers.BigNumber.from("0")
+      );
+      if (!totalLiquidityNet.eq(0)) {
+        tickList.push({
+          index: bestTick + tickSpacing,
+          liquidityGross: "0",
+          liquidityNet: totalLiquidityNet.mul(-1).toString(),
+          feeGrowthOutside0X128: "0",
+          feeGrowthOutside1X128: "0",
+        });
+      }
+
+      const tickCurrent = slot0.tick;
+      console.log("Current Tick:", tickCurrent.toString());
+
+      // Construct the pool object
+      let pool;
+      try {
+        pool = new Pool(
+          currencyA,
+          currencyB,
+          fee,
+          tickSpacing,
+          hooks,
+          slot0.sqrtPriceX96.toString(),
+          liquidity,
+          tickCurrent,
+          tickList
+        );
+        console.log("Pool Object:", pool);
+      } catch (poolError) {
+        console.error("Error creating Pool:", poolError);
+        setSwapResult(`Pool creation failed: ${poolError.message}`);
+        setIsLoading(false);
+        return;
+      }
+
+      // Build the trade route and trade object
+      const route = new Route([pool], currencyA, currencyB);
+      console.log("Route:", route);
+
+      const inputCurrencyAmount = CurrencyAmount.fromRawAmount(currencyA, typedValueParsed.toString());
+      console.log("Input Currency Amount Object:", inputCurrencyAmount);
+
+      const trade = await Trade.exactIn(route, inputCurrencyAmount);
+      console.log("Trade Object:", trade);
+
+      // Set up the position planner and add the trade with a slippage tolerance (0.5%)
+      const planner = new V4PositionPlanner();
+      const slippageTolerance = new Percent(50, 10_000);
+      planner.addTrade(trade, slippageTolerance);
+
+      // If the fromToken is an ERC20 (non-native), set up and add permit data for approval
+      if (fromToken !== '0x0000000000000000000000000000000000001010') {
+        const permitInfo = await planner.getPermitData({
+          token: fromToken,
+          amount: typedValueParsed,
+          owner: recipient,
+          spender: '0x1095692A6237d83C6a72F3F5eFEdb9A670C49223', // Router address
+          deadline: Math.floor(Date.now() / 1000) + 3600, // Valid for 1 hour
+        });
+
+        console.log("Permit Info:", permitInfo);
+        console.log("Permit Domain:", permitInfo.domain);
+        console.log("Permit Types:", permitInfo.types);
+        console.log("Permit Message:", permitInfo.message);
+
+        // Sign the permit data using EIP-712
+        const signature = await signer._signTypedData(
+          permitInfo.domain,
+          permitInfo.types,
+          permitInfo.message
+        );
+
+        // Encode and add the permit data to the planner
+        const encodedPermitBatch = planner.encodePermitBatch([
+          { permit: permitInfo.message, signature }
+        ]);
+        planner.addPermit(encodedPermitBatch);
+        console.log("Permit data encoded and added:", encodedPermitBatch);
+      }
+
+      // Finalize the planner data for the transaction
+      const plannerData = planner.finalize();
+      console.log("Planner Data:", plannerData);
+
+      // Build the transaction object
+      const routerAddress = '0x1095692A6237d83C6a72F3F5eFEdb9A670C49223';
+      const transactionData = {
+        data: plannerData,
+        to: routerAddress,
+        from: recipient,
       };
 
-      // Send transaction
-      const tx = await signer.sendTransaction(transaction);
-      const receipt = await tx.wait();
-      setSwapResult(`Swap successful! Transaction hash: ${receipt.transactionHash}`);
+      // If swapping a native token, include the ETH (or MATIC, etc.) value in the transaction.
+      if (fromToken === '0x0000000000000000000000000000000000001010') {
+        // Add 1 ETH as fee buffer (1 ETH = 10^18 wei)
+        const feeBuffer = ethers.utils.parseEther("1");
+        transactionData.value = typedValueParsed.add(feeBuffer);
+      }
+
+      // Manually set a gas limit instead of estimating gas
+      const manualGasLimit = ethers.BigNumber.from("1000000"); // 1,000,000 gas limit
+      transactionData.gasLimit = manualGasLimit;
+      console.log("Manual gas limit set:", manualGasLimit.toString());
+
+      // Send the transaction
+      try {
+        const txResponse = await signer.sendTransaction(transactionData);
+        console.log('Transaction sent:', txResponse.hash);
+        setSwapResult(`Transaction sent. Hash: ${txResponse.hash}`);
+
+        const receipt = await txResponse.wait();
+        console.log('Transaction confirmed:', receipt);
+        setSwapResult(`Swap successful! Transaction hash: ${receipt.transactionHash}`);
+      } catch (sendError) {
+        console.error('Transaction send error:', sendError);
+        setSwapResult(`Swap failed: ${sendError.message}`);
+      }
+
     } catch (error) {
+      console.error('Swap error:', error);
       setSwapResult(`Swap failed: ${error.message}`);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -80,10 +291,15 @@ const TradeComponent = () => {
         type="text"
         placeholder="Amount"
         value={amount}
-        onChange={(e) => setAmount(e.target.value)}
+        onChange={(e) => {
+          console.log("New amount input:", e.target.value);
+          setAmount(e.target.value);
+        }}
       />
-      <button onClick={handleSwap}>Swap</button>
-      <p>{swapResult}</p>
+      <button onClick={handleSwap} disabled={isLoading}>
+        {isLoading ? 'Swapping...' : 'Swap'}
+      </button>
+      {swapResult && <p>{swapResult}</p>}
     </div>
   );
 };
