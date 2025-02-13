@@ -52,7 +52,7 @@ const TradeComponent = () => {
       const typedValueParsed = ethers.utils.parseUnits(amount.trim(), 18);
       logBN("Parsed input amount:", typedValueParsed);
 
-      // Set the chainId (for example, Polygon = 137)
+      // Set the chainId for Polygon as 137
       const chainId = 137;
 
       // Create currency objects
@@ -73,7 +73,6 @@ const TradeComponent = () => {
       console.log("Pool ID:", poolId);
 
       // Set up state view contract to fetch pool data.
-      // IMPORTANT: Verify that the stateViewAddress is correct for your network.
       const stateViewAddress = '0x5ea1bd7974c8a611cbab0bdcafcb1d9cc9b3ba5a';
       const stateViewABI = [
         "function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)",
@@ -142,7 +141,6 @@ const TradeComponent = () => {
         feeGrowthOutside1X128: bestTickInfo.feeGrowthOutside1X128.toString(),
       }];
 
-      // Optionally add an extra tick based on total liquidity net
       const totalLiquidityNet = tickList.reduce(
         (acc, tick) => ethers.BigNumber.from(tick.liquidityNet).add(acc),
         ethers.BigNumber.from("0")
@@ -239,7 +237,7 @@ const TradeComponent = () => {
         from: recipient,
       };
 
-      // If swapping a native token, include the ETH (or MATIC, etc.) value in the transaction.
+      // If swapping a native token, include the MATIC value in the transaction.
       if (fromToken === '0x0000000000000000000000000000000000001010') {
         // Add 1 ETH as fee buffer (1 ETH = 10^18 wei)
         const feeBuffer = ethers.utils.parseEther("1");
